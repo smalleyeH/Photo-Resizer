@@ -229,3 +229,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+echo "cropper.log" >> .gitignore
+echo "input_photos/" >> .gitignore
+echo "output_slides/" >> .gitignore

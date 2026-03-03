@@ -114,46 +114,97 @@ def _sort_points(pts):
     return rect
 
 
+def _find_quad(edge_img, min_area, max_area):
+    """
+    從邊緣圖中找四邊形候選。
+    嘗試多個 approxPolyDP 容差值，增加找到四邊形的機會。
+    回傳所有合格候選的 list: [(area, pts), ...]
+    """
+    cnts = cv2.findContours(edge_img.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_L1)
+    cnts = imutils.grab_contours(cnts)
+    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:15]
+    candidates = []
+    for ct in cnts:
+        area = cv2.contourArea(ct)
+        if area < min_area or area > max_area:
+            continue
+        peri = cv2.arcLength(ct, True)
+        for tol in [0.015, 0.02, 0.03, 0.04]:
+            approx = cv2.approxPolyDP(ct, tol * peri, True)
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2).astype("float32")
+                rect = _sort_points(pts)
+                tl, tr, br, bl = rect
+                w = max(np.linalg.norm(tr - tl), np.linalg.norm(br - bl))
+                h = max(np.linalg.norm(bl - tl), np.linalg.norm(br - tr))
+                if w < 1 or h < 1:
+                    continue
+                ratio = max(w, h) / min(w, h)
+                if ratio > 4.0:
+                    continue
+                if not cv2.isContourConvex(approx):
+                    continue
+                candidates.append((area, rect))
+                break
+    return candidates
+
+
 def auto_detect(img):
     """
-    嘗試自動偵測圖片中的投影片（矩形區域）。
+    Multi-strategy slide detection.
 
-    流程：
-    1. 把圖片縮小到高度 900px（加速處理）
-    2. 轉灰階 -> 高斯模糊（去雜訊）-> Canny 邊緣偵測
-    3. 膨脹邊緣（讓斷裂的邊連起來）
-    4. 找輪廓，按面積排序，取最大的 8 個
-    5. 對每個輪廓做多邊形近似，找到 4 個頂點的就是投影片
-    6. 如果找不到，就回傳一個預設的內縮矩形（留 10% 邊距）
+    Strategy A: multi-threshold Canny edge detection
+    Strategy B: adaptive threshold (handles uneven lighting)
+    Strategy C: Otsu threshold (handles high contrast slides)
 
-    回傳：(四個角點座標, 是否成功偵測)
+    Each strategy generates an edge map, then _find_quad extracts
+    quadrilateral candidates. The largest valid candidate wins.
     """
     h0, w0 = img.shape[:2]
-    scale  = 900 / h0                                    # 計算縮放比例
-    view   = cv2.resize(img, (int(w0 * scale), 900))     # 縮小加速
-    gray   = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)      # 轉灰階
-    gray   = cv2.GaussianBlur(gray, (5, 5), 0)           # 模糊去雜訊
-    edged  = cv2.Canny(gray, 30, 120)                    # Canny 邊緣偵測
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    edged  = cv2.dilate(edged, kernel, iterations=1)     # 膨脹讓邊緣更完整
+    scale = 900 / h0
+    view = cv2.resize(img, (int(w0 * scale), 900))
+    img_area = view.shape[0] * view.shape[1]
+    min_area = img_area * 0.05
+    max_area = img_area * 0.98
 
-    # 找所有輪廓，按面積由大到小排序，只看前 8 個
-    cnts = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_TC89_L1)
-    cnts = imutils.grab_contours(cnts)
-    cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:8]
+    gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    kclose = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    kdilate = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    for c in cnts:
-        peri   = cv2.arcLength(c, True)                   # 輪廓周長
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)  # 多邊形近似（容差 2%）
-        if len(approx) == 4:
-            pts = approx.reshape(4, 2).astype("float32")
-            return _sort_points(pts) / scale, True
+    all_candidates = []
 
-    # 偵測失敗，回傳預設的內縮框（圖片邊界往內 10%）
+    # --- Strategy A: multiple Canny thresholds ---
+    for lo, hi in [(20, 80), (30, 120), (50, 150), (75, 200)]:
+        edged = cv2.Canny(blur, lo, hi)
+        edged = cv2.morphologyEx(edged, cv2.MORPH_CLOSE, kclose)
+        edged = cv2.dilate(edged, kdilate, iterations=1)
+        all_candidates.extend(_find_quad(edged, min_area, max_area))
+
+    # --- Strategy B: adaptive threshold ---
+    adapt = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 21, 5)
+    adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE, kclose)
+    adapt = cv2.dilate(adapt, kdilate, iterations=1)
+    all_candidates.extend(_find_quad(adapt, min_area, max_area))
+
+    # --- Strategy C: Otsu threshold ---
+    _, otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    otsu = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kclose)
+    otsu = cv2.dilate(otsu, kdilate, iterations=1)
+    all_candidates.extend(_find_quad(otsu, min_area, max_area))
+
+    if all_candidates:
+        all_candidates.sort(key=lambda x: x[0], reverse=True)
+        best_pts = all_candidates[0][1]
+        return best_pts / scale, True
+
     h, w = img.shape[:2]
-    pts  = np.array([[w*.1, h*.1], [w*.9, h*.1],
-                     [w*.9, h*.9], [w*.1, h*.9]], dtype="float32")
+    pts = np.array([[w*.1, h*.1], [w*.9, h*.1],
+                    [w*.9, h*.9], [w*.1, h*.9]], dtype="float32")
     return pts, False
+
 
 
 # =============================================
@@ -244,6 +295,16 @@ class PointEditor:
         self.orig   = self.pts.copy()
         self.sel    = -1
         self.action = "cancel"
+
+    def _corner_zone_index(self, x, y):
+        h, w = self.view.shape[:2]
+        zw = w * self.CORNER_ZONE
+        zh = h * self.CORNER_ZONE
+        if   x < zw       and y < zh:       return 0
+        elif x > (w - zw) and y < zh:       return 1
+        elif x > (w - zw) and y > (h - zh): return 2
+        elif x < zw       and y > (h - zh): return 3
+        else:                                return -1
 
     def _corner_zone_index(self, x, y):
         h, w = self.view.shape[:2]
